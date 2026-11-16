@@ -45,7 +45,7 @@ env:
   PDV_SOURCE_SHA: ${{ inputs.source_sha }}
   PDV_VERSION: ${{ inputs.version }}
   PDV_BASELINE_VERSION: ${{ inputs.baseline_version }}
-  PDV_TRUSTED_BRANCH: feature/pdv-msi-auto-update
+  PDV_TRUSTED_BRANCH: main
   GH_TOKEN: ${{ github.token }}
 
 jobs:
