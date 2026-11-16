@@ -17,12 +17,12 @@ on:
       version:
         description: Candidate version (major.minor.patch)
         type: string
-        default: '1.0.0'
+        default: '1.0.1'
         required: true
       baseline_version:
         description: Earlier version for isolated MSI upgrade QA
         type: string
-        default: '0.9.0'
+        default: '0.9.1'
         required: true
       artifact_run_id:
         description: Successful BuildAndQa run ID (PromoteStable only)
@@ -86,6 +86,8 @@ jobs:
           Assert-ReleaseVersion $env:PDV_BASELINE_VERSION
           if ([version]$env:PDV_BASELINE_VERSION -ge [version]$env:PDV_VERSION) { throw 'Baseline must be older than candidate.' }
           ./scripts/release/Test-ReleaseScripts.ps1
+          ./scripts/packaging/Test-Packaging.ps1
+          ./scripts/packaging/Test-MsiSchema.ps1
 
       - name: Install pinned .NET SDK
         if: inputs.operation == 'BuildAndQa'
