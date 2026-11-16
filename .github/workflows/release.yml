@@ -191,8 +191,17 @@ jobs:
           PDV_CODESIGN_PASSWORD: ${{ secrets.PDV_CODESIGN_PASSWORD }}
         run: |
           $qaLog = Join-Path $env:RUNNER_TEMP 'pdv-native-msi-qa.log'
-          & ./source/scripts/packaging/Invoke-InstallerSmoke.ps1 -BaseMsi "./bundles/baseline/Seducao-Pdv-$env:PDV_BASELINE_VERSION-win-x64.msi" -NextMsi "./bundles/candidate/Seducao-Pdv-$env:PDV_VERSION-win-x64.msi" -OutputDirectory "$env:RUNNER_TEMP/pdv-msi-qa" -IsolatedRunner -SignRollbackFixture {param($path) & "$env:GITHUB_WORKSPACE/source/scripts/release/Sign-ReleaseFiles.ps1" -Path @($path)} *> $qaLog
-          if (!$?) { throw 'Native MSI QA failed; private diagnostics remain on the ephemeral runner.' }
+          try {
+            & ./source/scripts/packaging/Invoke-InstallerSmoke.ps1 -BaseMsi "./bundles/baseline/Seducao-Pdv-$env:PDV_BASELINE_VERSION-win-x64.msi" -NextMsi "./bundles/candidate/Seducao-Pdv-$env:PDV_VERSION-win-x64.msi" -OutputDirectory "$env:RUNNER_TEMP/pdv-msi-qa" -IsolatedRunner -SignRollbackFixture {param($path) & "$env:GITHUB_WORKSPACE/source/scripts/release/Sign-ReleaseFiles.ps1" -Path @($path)} *> $qaLog
+          } catch {
+            foreach ($log in Get-ChildItem "$env:RUNNER_TEMP/pdv-msi-qa" -Filter '*.log' -File -ErrorAction SilentlyContinue) {
+              $text = ([IO.File]::ReadLines($log.FullName) | Where-Object { $_ -notmatch '(?i)^Property\(|PROPERTY CHANGE:' }) -join "`n"
+              $actions = @([regex]::Matches($text, '(?m)^Action ended [0-9:]+: ([A-Za-z0-9_]{1,72})\. Return value 3\.') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique -First 30)
+              $codes = @([regex]::Matches($text, '(?i)\b(?:Error|Note: 1:)\s+([1-9][0-9]{2,4})(?=[:.\s])') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique -First 30)
+              Write-Output "MSI diagnostic $($log.Name): failed actions=$($actions -join ','); codes=$($codes -join ',')."
+            }
+            throw 'Native MSI QA failed; only action names and numeric codes were disclosed.'
+          }
           Write-Output 'Native MSI upgrade/rollback/repair/uninstall QA passed.'
 
       - name: Publish complete prereleases, preserving exact MSI bytes
