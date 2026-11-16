@@ -199,6 +199,11 @@ jobs:
               $actions = @([regex]::Matches($text, '(?m)^Action ended [0-9:]+: ([A-Za-z0-9_]{1,72})\. Return value 3\.') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique -First 30)
               $codes = @([regex]::Matches($text, '(?i)\b(?:Error|Note: 1:)\s+([1-9][0-9]{2,4})(?=[:.\s])') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique -First 30)
               Write-Output "MSI diagnostic $($log.Name): failed actions=$($actions -join ','); codes=$($codes -join ',')."
+              foreach ($line in $text -split "`n" | Where-Object { $_ -match '\bNote: 1: 2228\b' }) {
+                $table = [regex]::Match($line, '\b3:\s*([A-Za-z_][A-Za-z0-9_]{0,71})\s+4:').Groups[1].Value
+                $identifiers = @([regex]::Matches($line, '`([A-Za-z_][A-Za-z0-9_]{0,71})`') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique -First 30)
+                Write-Output "MSI unknown-table diagnostic: table=$table; identifiers=$($identifiers -join ',')."
+              }
             }
             throw 'Native MSI QA failed; only action names and numeric codes were disclosed.'
           }
