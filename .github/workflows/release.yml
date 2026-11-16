@@ -204,8 +204,12 @@ jobs:
                 $identifiers = @([regex]::Matches($line, '`([A-Za-z_][A-Za-z0-9_]{0,71})`') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique -First 30)
                 Write-Output "MSI unknown-table diagnostic: table=$table; identifiers=$($identifiers -join ',')."
               }
+              # This phase runs only the native installer: no application, API configuration or credentials.
+              $validation = [regex]::Match($text, '(?ms)^Action start[^\r\n]*: InstallValidate\..*?^Action ended[^\r\n]*: InstallValidate\. Return value 3\.').Value
+              $validation = [regex]::Replace($validation, '(?i)[A-Z]:[\\/][^\r\n]*', '[runner-path]')
+              $validation -split "`n" | Select-Object -First 80 | Write-Output
             }
-            throw 'Native MSI QA failed; only action names and numeric codes were disclosed.'
+            throw 'Native MSI QA failed; sanitized native installer diagnostics shown above.'
           }
           Write-Output 'Native MSI upgrade/rollback/repair/uninstall QA passed.'
 
