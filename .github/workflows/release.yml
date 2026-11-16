@@ -1,0 +1,264 @@
+name: PDV manual release
+run-name: PDV ${{ inputs.operation }} ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build/QA prereleases or promote the existing candidate
+        type: choice
+        options: [BuildAndQa, PromoteStable]
+        default: BuildAndQa
+        required: true
+      source_sha:
+        description: Full reviewed SHA from the trusted private branch
+        type: string
+        required: true
+      version:
+        description: Candidate version (major.minor.patch)
+        type: string
+        default: '1.0.0'
+        required: true
+      baseline_version:
+        description: Earlier version for isolated MSI upgrade QA
+        type: string
+        default: '0.9.0'
+        required: true
+      artifact_run_id:
+        description: Successful BuildAndQa run ID (PromoteStable only)
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: pdv-public-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  PDV_SOURCE_SHA: ${{ inputs.source_sha }}
+  PDV_VERSION: ${{ inputs.version }}
+  PDV_BASELINE_VERSION: ${{ inputs.baseline_version }}
+  PDV_TRUSTED_BRANCH: feature/pdv-msi-auto-update
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Validate fixed repository and reviewed input
+        env:
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'seducao-delivery/pdv-releases') { throw 'Unexpected repository.' }
+          if ($env:OPERATION -cnotin @('BuildAndQa', 'PromoteStable')) { throw 'Unexpected operation.' }
+          if ($env:PDV_SOURCE_SHA -cnotmatch '^[a-f0-9]{40}$') { throw 'A full reviewed SHA is required.' }
+          if ($env:OPERATION -eq 'PromoteStable' -and $env:ARTIFACT_RUN_ID -notmatch '^[1-9][0-9]*$') { throw 'A successful QA run ID is required.' }
+
+      - name: Checkout private source with read-only deployment key
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: seducao-delivery/pdv
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.PDV_SOURCE_SSH_KEY }}
+          ssh-strict: true
+          persist-credentials: false
+          fetch-depth: 0
+          path: source
+
+      - name: Require SHA on the fixed trusted source branch
+        working-directory: source
+        run: |
+          $head = git rev-parse HEAD
+          if ($head -cne $env:PDV_SOURCE_SHA) { throw 'Source SHA mismatch.' }
+          git merge-base --is-ancestor $env:PDV_SOURCE_SHA "refs/remotes/origin/$env:PDV_TRUSTED_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'SHA does not belong to the trusted branch.' }
+          . ./scripts/release/Release.Common.ps1
+          Assert-ReleaseVersion $env:PDV_VERSION
+          Assert-ReleaseVersion $env:PDV_BASELINE_VERSION
+          if ([version]$env:PDV_BASELINE_VERSION -ge [version]$env:PDV_VERSION) { throw 'Baseline must be older than candidate.' }
+          ./scripts/release/Test-ReleaseScripts.ps1
+
+      - name: Install pinned .NET SDK
+        if: inputs.operation == 'BuildAndQa'
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: source/global.json
+
+      - name: Locate canonical candidate bundle
+        if: inputs.operation == 'BuildAndQa'
+        id: candidate
+        run: ./source/scripts/release/Find-ReleaseArtifact.ps1 -Version $env:PDV_VERSION
+
+      - name: Locate canonical baseline bundle
+        if: inputs.operation == 'BuildAndQa'
+        id: baseline
+        run: ./source/scripts/release/Find-ReleaseArtifact.ps1 -Version $env:PDV_BASELINE_VERSION
+
+      - name: Build/test/package/sign candidate once
+        if: inputs.operation == 'BuildAndQa' && steps.candidate.outputs.reuse_run_id == '' && steps.candidate.outputs.reuse_release_tag == ''
+        env:
+          PDV_MANIFEST_SIGNING_KEY: ${{ secrets.PDV_MANIFEST_SIGNING_KEY }}
+          PDV_CODESIGN_PFX: ${{ secrets.PDV_CODESIGN_PFX }}
+          PDV_CODESIGN_PASSWORD: ${{ secrets.PDV_CODESIGN_PASSWORD }}
+        run: ./source/scripts/release/Build-Release.ps1 -Version $env:PDV_VERSION -OutputDirectory "$env:GITHUB_WORKSPACE/bundles/candidate"
+
+      - name: Retain canonical candidate (no source, PDB or logs)
+        if: inputs.operation == 'BuildAndQa' && steps.candidate.outputs.reuse_run_id == '' && steps.candidate.outputs.reuse_release_tag == ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pdv-release-${{ inputs.version }}
+          path: |
+            bundles/candidate/Seducao-Pdv-${{ inputs.version }}-win-x64.msi
+            bundles/candidate/latest.json
+            bundles/candidate/SHA256SUMS
+            bundles/candidate/bundle.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Build/test/package/sign baseline once
+        if: inputs.operation == 'BuildAndQa' && steps.baseline.outputs.reuse_run_id == '' && steps.baseline.outputs.reuse_release_tag == ''
+        env:
+          PDV_MANIFEST_SIGNING_KEY: ${{ secrets.PDV_MANIFEST_SIGNING_KEY }}
+          PDV_CODESIGN_PFX: ${{ secrets.PDV_CODESIGN_PFX }}
+          PDV_CODESIGN_PASSWORD: ${{ secrets.PDV_CODESIGN_PASSWORD }}
+        run: ./source/scripts/release/Build-Release.ps1 -Version $env:PDV_BASELINE_VERSION -OutputDirectory "$env:GITHUB_WORKSPACE/bundles/baseline"
+
+      - name: Retain canonical baseline (no source, PDB or logs)
+        if: inputs.operation == 'BuildAndQa' && steps.baseline.outputs.reuse_run_id == '' && steps.baseline.outputs.reuse_release_tag == ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pdv-release-${{ inputs.baseline_version }}
+          path: |
+            bundles/baseline/Seducao-Pdv-${{ inputs.baseline_version }}-win-x64.msi
+            bundles/baseline/latest.json
+            bundles/baseline/SHA256SUMS
+            bundles/baseline/bundle.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Reuse canonical candidate
+        if: inputs.operation == 'BuildAndQa' && steps.candidate.outputs.reuse_run_id != ''
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pdv-release-${{ inputs.version }}
+          run-id: ${{ steps.candidate.outputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+          path: bundles/candidate
+
+      - name: Reuse canonical baseline
+        if: inputs.operation == 'BuildAndQa' && steps.baseline.outputs.reuse_run_id != ''
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pdv-release-${{ inputs.baseline_version }}
+          run-id: ${{ steps.baseline.outputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+          path: bundles/baseline
+
+      - name: Recover canonical candidate from immutable release
+        if: inputs.operation == 'BuildAndQa' && steps.candidate.outputs.reuse_release_tag != ''
+        run: ./source/scripts/release/Restore-ReleaseBundle.ps1 -Version $env:PDV_VERSION -PublicKeyPath ./source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem -OutputDirectory ./bundles/candidate
+
+      - name: Recover perpetual baseline from immutable release
+        if: inputs.operation == 'BuildAndQa' && steps.baseline.outputs.reuse_release_tag != ''
+        run: ./source/scripts/release/Restore-ReleaseBundle.ps1 -Version $env:PDV_BASELINE_VERSION -PublicKeyPath ./source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem -OutputDirectory ./bundles/baseline
+
+      - name: Verify canonical manifests and reviewed source before any installation
+        if: inputs.operation == 'BuildAndQa'
+        run: |
+          $pin = './source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem'
+          . ./source/scripts/release/Release.Common.ps1
+          foreach ($item in @(@{path='./bundles/candidate';version=$env:PDV_VERSION}, @{path='./bundles/baseline';version=$env:PDV_BASELINE_VERSION})) {
+            ./source/scripts/release/Test-ReleaseBundle.ps1 -Directory $item.path -PublicKeyPath $pin
+            $identity = Read-ReleaseProvenance $item.path $pin
+            if ($identity.version -cne $item.version -or ($item.path -eq './bundles/candidate' -and $identity.sourceCommit -cne $env:PDV_SOURCE_SHA)) { throw 'Candidate belongs to different reviewed source/version; select its original SHA or a new version.' }
+          }
+
+      - name: Verify MSI upgrade, rollback, repair and uninstall in isolated Windows
+        if: inputs.operation == 'BuildAndQa'
+        env:
+          PDV_CODESIGN_PFX: ${{ secrets.PDV_CODESIGN_PFX }}
+          PDV_CODESIGN_PASSWORD: ${{ secrets.PDV_CODESIGN_PASSWORD }}
+        run: |
+          $qaLog = Join-Path $env:RUNNER_TEMP 'pdv-native-msi-qa.log'
+          & ./source/scripts/packaging/Invoke-InstallerSmoke.ps1 -BaseMsi "./bundles/baseline/Seducao-Pdv-$env:PDV_BASELINE_VERSION-win-x64.msi" -NextMsi "./bundles/candidate/Seducao-Pdv-$env:PDV_VERSION-win-x64.msi" -OutputDirectory "$env:RUNNER_TEMP/pdv-msi-qa" -IsolatedRunner -SignRollbackFixture {param($path) & "$env:GITHUB_WORKSPACE/source/scripts/release/Sign-ReleaseFiles.ps1" -Path @($path)} *> $qaLog
+          if (!$?) { throw 'Native MSI QA failed; private diagnostics remain on the ephemeral runner.' }
+          Write-Output 'Native MSI upgrade/rollback/repair/uninstall QA passed.'
+
+      - name: Publish complete prereleases, preserving exact MSI bytes
+        if: inputs.operation == 'BuildAndQa'
+        run: |
+          $pin = './source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem'
+          ./source/scripts/release/Publish-Release.ps1 -Directory ./bundles/baseline -PublicKeyPath $pin -Mode Prerelease -Execute
+          ./source/scripts/release/Publish-Release.ps1 -Directory ./bundles/candidate -PublicKeyPath $pin -Mode Prerelease -Execute
+
+      - name: Exercise real GitHub download and helper in isolated Windows
+        if: inputs.operation == 'BuildAndQa'
+        run: ./source/scripts/release/Invoke-UpdateQa.ps1 -BaselineDirectory ./bundles/baseline -CandidateDirectory ./bundles/candidate
+
+      - name: Record successful QA without copying or rebuilding the canonical bundle
+        if: inputs.operation == 'BuildAndQa'
+        run: |
+          [IO.Directory]::CreateDirectory('./qa') | Out-Null
+          . ./source/scripts/release/Release.Common.ps1
+          $manifest = Read-ReleaseBundle ./bundles/candidate ./source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem
+          @{ version = $env:PDV_VERSION; sourceCommit = $env:PDV_SOURCE_SHA; installerSha256 = $manifest.installer.sha256; manifestSha256 = (Get-FileHash ./bundles/candidate/latest.json -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json -Compress | Set-Content ./qa/qa.json
+
+      - name: Retain successful QA receipt
+        if: inputs.operation == 'BuildAndQa'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pdv-qa-${{ inputs.version }}
+          path: qa/qa.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true # Only the QA receipt; canonical MSI artifacts are never overwritten.
+
+      - name: Require successful QA run before stable promotion
+        if: inputs.operation == 'PromoteStable'
+        env:
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+        run: |
+          . ./source/scripts/release/GitHub.Release.ps1
+          $run = Invoke-ReleaseApi "actions/runs/$env:ARTIFACT_RUN_ID"
+          if ($run.conclusion -cne 'success' -or $run.event -cne 'workflow_dispatch' -or $run.path -cne '.github/workflows/release.yml') { throw 'A successful manual QA run is required.' }
+
+      - name: Download receipt from successful QA run
+        if: inputs.operation == 'PromoteStable'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pdv-qa-${{ inputs.version }}
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: qa
+
+      - name: Resolve exact canonical bundle from QA receipt
+        if: inputs.operation == 'PromoteStable'
+        run: |
+          $receipt = Get-Content ./qa/qa.json -Raw | ConvertFrom-Json
+          if ($receipt.version -cne $env:PDV_VERSION -or $receipt.sourceCommit -cne $env:PDV_SOURCE_SHA) { throw 'QA receipt does not match the reviewed candidate. If expired, rerun QA using unchanged immutable releases.' }
+
+      - name: Recover original immutable candidate for promotion (never rebuild)
+        if: inputs.operation == 'PromoteStable'
+        run: ./source/scripts/release/Restore-ReleaseBundle.ps1 -Version $env:PDV_VERSION -PublicKeyPath ./source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem -OutputDirectory ./bundles/candidate
+
+      - name: Verify source identity and promote unchanged bundle
+        if: inputs.operation == 'PromoteStable'
+        run: |
+          . ./source/scripts/release/Release.Common.ps1
+          $pin = './source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem'
+          $bundle = Read-ReleaseProvenance ./bundles/candidate $pin
+          $manifest = Read-ReleaseBundle ./bundles/candidate $pin
+          $receipt = Get-Content ./qa/qa.json -Raw | ConvertFrom-Json
+          if ($bundle.sourceCommit -cne $env:PDV_SOURCE_SHA -or $bundle.version -cne $env:PDV_VERSION -or $receipt.installerSha256 -cne $manifest.installer.sha256 -or $receipt.manifestSha256 -cne (Get-FileHash ./bundles/candidate/latest.json -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Signed source/provenance and QA receipt hashes do not match.' }
+          ./source/scripts/release/Publish-Release.ps1 -Directory ./bundles/candidate -PublicKeyPath ./source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem -Mode Stable -Execute
