@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build/QA prereleases or promote the existing candidate
+        description: Build/QA, promote, or verify the immutable 1.0.3 to 1.0.4 update
         type: choice
-        options: [BuildAndQa, PromoteStable]
+        options: [BuildAndQa, PromoteStable, QAExisting]
         default: BuildAndQa
         required: true
       source_sha:
@@ -59,9 +59,10 @@ jobs:
           OPERATION: ${{ inputs.operation }}
         run: |
           if ($env:GITHUB_REPOSITORY -cne 'seducao-delivery/pdv-releases') { throw 'Unexpected repository.' }
-          if ($env:OPERATION -cnotin @('BuildAndQa', 'PromoteStable')) { throw 'Unexpected operation.' }
+          if ($env:OPERATION -cnotin @('BuildAndQa', 'PromoteStable', 'QAExisting')) { throw 'Unexpected operation.' }
           if ($env:PDV_SOURCE_SHA -cnotmatch '^[a-f0-9]{40}$') { throw 'A full reviewed SHA is required.' }
           if ($env:OPERATION -eq 'PromoteStable' -and $env:ARTIFACT_RUN_ID -notmatch '^[1-9][0-9]*$') { throw 'A successful QA run ID is required.' }
+          if ($env:OPERATION -eq 'QAExisting' -and ($env:PDV_BASELINE_VERSION -cne '1.0.3' -or $env:PDV_VERSION -cne '1.0.4')) { throw 'Existing-update QA is restricted to the canonical 1.0.3 to 1.0.4 pair.' }
 
       - name: Checkout private source with read-only deployment key
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -88,6 +89,17 @@ jobs:
           ./scripts/release/Test-ReleaseScripts.ps1
           ./scripts/packaging/Test-Packaging.ps1
           ./scripts/packaging/Test-MsiSchema.ps1
+
+      - name: Recover immutable pair for existing-update QA without rebuilding
+        if: inputs.operation == 'QAExisting'
+        run: |
+          $pin = './source/src/Seducao.Pdv.Infrastructure/Updating/Trust/manifest-public.pem'
+          ./source/scripts/release/Restore-ReleaseBundle.ps1 -Version '1.0.3' -PublicKeyPath $pin -OutputDirectory ./bundles/baseline
+          ./source/scripts/release/Restore-ReleaseBundle.ps1 -Version '1.0.4' -PublicKeyPath $pin -OutputDirectory ./bundles/candidate
+
+      - name: Verify published baseline updater with immutable assets only
+        if: inputs.operation == 'QAExisting'
+        run: ./source/scripts/release/Invoke-ExistingUpdateQa.ps1 -BaselineDirectory ./bundles/baseline -CandidateDirectory ./bundles/candidate -Execute
 
       - name: Install pinned .NET SDK
         if: inputs.operation == 'BuildAndQa'
